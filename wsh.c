@@ -1,865 +1,746 @@
-/* ************************************************************************
-> File Name:     letter-boxed.c
-> Author:        Chengtao Dai
-> cs login:         chengtao
-> Created Time:  Tue  10/1 12:31:17 2024
-> Description:  See README.md
-
- ************************************************************************/
-
+#include "wsh.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
-#include <fcntl.h> 
-#include <ctype.h>
-#include "wsh.h"
+#include <string.h>
+#include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <locale.h>
+#include <sys/stat.h>
 
-// error message for any kind of invalid operation
-const char *error_message = "An error has occurred\n";
+#define MAX_HISTORY_SIZE 100
+#define DEFAULT_HISTORY_SIZE 5
+
+int history_size = DEFAULT_HISTORY_SIZE;
+char *history[MAX_HISTORY_SIZE];
+int hist_count = 0; 
+int last_exit_status = 0;  
 ShellVar shell_vars[MAX_VARS];
-int num_vars = 0;
-history_t history = {NULL, DEFAULT_HISTORY_SIZE, 0, 0, 0};
-int last_cmd_rc = 0;
+int var_count = 0;
+bool should_exit = false;
+bool path_invalid = false;
+int interactive_mode = 0;
 
-void init_path()
-{
-    setenv("PATH", "/bin", 1);
-}
+// xtra funcs
+bool is_builtin_command(char *cmd);  
+char *trimmer(char *str);
+int process_history_builtin(char **args);
+int cmp_entries(const void *a, const void *b);
 
-void interactive_mode()
-{
-    char command[MAX_COMMAND_LENGTH];
+// infinte shell loop 
+void shell_loop() {
+    char line[MAX_LINE];
 
-    while (1)
-    {
-        printf("wsh> ");
-        fflush(stdout);
-
-        // get user input
-        if (fgets(command, MAX_COMMAND_LENGTH, stdin) == NULL)
-        {
-            // fgets returns NULL on EOF, break the loop to exit
-            break;
+    while (1) {
+        if (interactive_mode) {
+            printf("wsh> ");
+            fflush(stdout); 
         }
-        // remove the newline character from the command
-        command[strcspn(command, "\n")] = 0;
-        // ignore lines that are comments or empty
-        if (is_comment(command) || strlen(command) == 0)
-        {
+
+        if (fgets(line, sizeof(line), stdin) == NULL) {
+            if (feof(stdin)) {
+                break;
+            }
             continue;
         }
-        // check if the command is 'exit'
-        if (strcmp(command, "exit") == 0)
-        {
+        line[strcspn(line, "\n")] = '\0';
+        char *trimmed_line = line;
+        while (*trimmed_line == ' ' || *trimmed_line == '\t') {
+            trimmed_line++;  
+        }
+        if (trimmed_line[0] == '#' || trimmed_line[0] == '\0') {
+            continue;  
+        }
+
+        if (strcmp(trimmed_line, "exit") == 0) {
             break;
         }
 
-        // execute the command
-        execute_command(command);
+        process_cmd(trimmed_line, true);
     }
 }
 
-void batch_mode(const char *batch_file)
-{
-    FILE *file = fopen(batch_file, "r");
-    if (file == NULL)
-    {
-        print_error("Error opening batch file");
-        exit(1);
+
+void process_cmd(char *cmd, bool add_to_history) {
+    char *args[MAX_ARGS];
+    int i = 0;
+    int saved_stdout = -1;
+    int saved_stdin = -1;
+    int  saved_stderr = -1;
+    char *redirection_files[3] = {NULL, NULL, NULL}; 
+    int redirection_types[3] = {0, 0, 0};            
+
+    char original_cmd[MAX_LINE];
+    strncpy(original_cmd, cmd, sizeof(original_cmd) - 1);
+    original_cmd[sizeof(original_cmd) - 1] = '\0';
+
+    if (add_to_history) {
+        history_add(original_cmd);
     }
 
-    char command[MAX_COMMAND_LENGTH];
-    while (fgets(command, MAX_COMMAND_LENGTH, file) != NULL)
-    {
-        // remove the newline character from the command
-        command[strcspn(command, "\n")] = 0;
-        // ignore lines that are comments or empty
-        if (is_comment(command) || strlen(command) == 0)
-        {
-            continue;
-        }
-        // check if the command is 'exit'
-        if (strcmp(command, "exit") == 0)
-        {
-            break;
-        }
+    char cmd_copy[MAX_LINE];
+    strncpy(cmd_copy, cmd, sizeof(cmd_copy) - 1);
+    cmd_copy[sizeof(cmd_copy) - 1] = '\0';
 
-        // execute the command
-        execute_command(command);
+    char *token = strtok(cmd_copy, " ");
+    while (token != NULL && i < MAX_ARGS) {
+        if (strcmp(token, "<") == 0 || strncmp(token, "<", 1) == 0 ||
+            strcmp(token, ">") == 0 || strncmp(token, ">", 1) == 0 ||
+            strcmp(token, ">>") == 0 || strncmp(token, ">>", 2) == 0 ||
+            strncmp(token, "2>", 2) == 0 || strncmp(token, "1>", 2) == 0 || strncmp(token, "0>", 2) == 0) {
+            char *redirection = token;
+            char *file = NULL;
+
+            // if with space
+            if (strcmp(redirection, "<") == 0) {
+                redirection_types[0] = 1;  
+                token = strtok(NULL, " ");
+                if (token == NULL) {
+                    if (!interactive_mode) {
+                        fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                    }
+                    return;
+                }
+                redirection_files[0] = token;
+            } else if (strncmp(redirection, "<", 1) == 0) {
+                // if no space
+                redirection_types[0] = 1;  
+                file = redirection + 1;
+                if (*file == '\0') {
+                    if (!interactive_mode) {
+                        fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                    }
+                    return;
+                }
+                redirection_files[0] = file;
+            } else if (strcmp(redirection, ">") == 0) {
+                redirection_types[1] = 1;  
+                token = strtok(NULL, " ");
+                if (token == NULL) {
+                    if (!interactive_mode) {
+                        fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                    }
+                    return;
+                }
+                redirection_files[1] = token;
+            } else if (strncmp(redirection, ">", 1) == 0 && strncmp(redirection, ">>", 2) != 0) {
+                redirection_types[1] = 1;  
+                file = redirection + 1;
+                if (*file == '\0') {
+                    if (!interactive_mode) {
+                        fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                    }
+                    return;
+                }
+                redirection_files[1] = file;
+            } else if (strcmp(redirection, ">>") == 0) {
+                redirection_types[1] = 2;  
+                token = strtok(NULL, " ");
+                if (token == NULL) {
+                    if (!interactive_mode) {
+                        fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                    }
+                    return;
+                }
+                redirection_files[1] = token;
+            } else if (strncmp(redirection, ">>", 2) == 0) {
+                // append no space
+                redirection_types[1] = 2;  
+                file = redirection + 2;
+                if (*file == '\0') {
+                    if (!interactive_mode) {
+                        fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                    }
+                    return;
+                }
+                redirection_files[1] = file;
+            } else if (strncmp(redirection, "2>", 2) == 0) {
+                // stderr 
+                redirection_types[2] = 1;  
+                file = redirection + 2;
+                if (*file == '\0') {
+                    token = strtok(NULL, " ");
+                    if (token == NULL) {
+                        if (!interactive_mode) {
+                            fprintf(stderr, "wsh: syntax error near unexpected token `newline'\n");
+                        }
+                        return;
+                    }
+                    redirection_files[2] = token;
+                } else {
+                    redirection_files[2] = file;
+                }
+            }
+        } else {
+            args[i++] = token;
+        }
+        token = strtok(NULL, " ");
+    }
+    args[i] = NULL;
+
+    sub_var(args);
+
+    if (args[0] == NULL) {
+        return;  
     }
 
-    fclose(file);
+    // input Redirection 
+    if (redirection_files[0] != NULL) {
+        int fd = open(redirection_files[0], O_RDONLY);
+        if (fd < 0) {
+            if (!interactive_mode) {
+                perror("open");
+            }
+            return;
+        }
+        saved_stdin = dup(STDIN_FILENO);
+        dup2(fd, STDIN_FILENO);
+        close(fd);
+    }
+
+    // osutput redirection
+    if (redirection_files[1] != NULL) {
+        int fd;
+        if (redirection_types[1] == 1) {  // Overwrite
+            fd = open(redirection_files[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        } else {  // Append
+            fd = open(redirection_files[1], O_WRONLY | O_CREAT | O_APPEND, 0644);
+        }
+        if (fd < 0) {
+            if (!interactive_mode) {
+                perror("open");
+            }
+            return;
+        }
+        saved_stdout = dup(STDOUT_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        close(fd);
+    }
+
+    // stderr redirect
+    if (redirection_files[2] != NULL) {
+        int fd = open(redirection_files[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            if (!interactive_mode) {
+                perror("open");
+            }
+            return;
+        }
+        saved_stderr = dup(STDERR_FILENO);
+        dup2(fd, STDERR_FILENO);
+        close(fd);
+    }
+
+    int builtin_status = process_builtin(args);
+    if (builtin_status != -1) {
+        last_exit_status = builtin_status;
+
+        if (saved_stdout != -1) {
+            dup2(saved_stdout, STDOUT_FILENO);
+            close(saved_stdout);
+        }
+        if (saved_stdin != -1) {
+            dup2(saved_stdin, STDIN_FILENO);
+            close(saved_stdin);
+        }
+        if (saved_stderr != -1) {
+            dup2(saved_stderr, STDERR_FILENO);
+            close(saved_stderr);
+        }
+
+        return;  
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        if (!interactive_mode) {
+            perror("Fork failed");
+        }
+        last_exit_status = 127;  
+        return;
+    }
+
+    if (pid == 0) {
+        if (strchr(args[0], '/') != NULL) {
+            execv(args[0], args);
+        } else {
+            char *path_env = getenv("PATH");
+            if (path_env == NULL) {
+                if (!interactive_mode) {
+                    perror("getenv");
+                }
+                exit(127);
+            }
+
+            char path_copy[MAX_LINE];
+            snprintf(path_copy, sizeof(path_copy), "%s", path_env);
+            char *path = strtok(path_copy, ":");
+            while (path != NULL) {
+                char full_path[MAX_LINE];
+                snprintf(full_path, sizeof(full_path), "%s/%s", path, args[0]);
+
+                if (access(full_path, X_OK) == 0) {
+                    execv(full_path, args);
+                }
+
+                path = strtok(NULL, ":");
+            }
+        }
+
+        if (!interactive_mode) {
+            fprintf(stderr, "wsh: command not found: %s\n", args[0]);
+        }
+        exit(127);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+
+        if (WIFEXITED(status)) {
+            last_exit_status = WEXITSTATUS(status);
+        }
+    }
+
+    if (saved_stdout != -1) {
+        dup2(saved_stdout, STDOUT_FILENO);
+        close(saved_stdout);
+    }
+    if (saved_stdin != -1) {
+        dup2(saved_stdin, STDIN_FILENO);
+        close(saved_stdin);
+    }
+    if (saved_stderr != -1) {
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stderr);
+    }
 }
 
-// 1: > | 2: < | 3: >> | 4: &> | 5: &>> | 6. 2>
-void handle_redirection(int redirect_type, char *filename)
-{
-    int fd;
-    if (redirect_type == 1) // output redirection
-    {
-        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd == -1)
-        {
-            perror("Failed to open output file");
-            exit(1);
+
+int process_builtin(char **args) {
+    if (strcmp(args[0], "cd") == 0) {
+        if (args[1] == NULL || args[2] != NULL) {
+            if (!interactive_mode) {
+                fprintf(stderr, "wsh: cd: wrong number of arguments\n");
+            }
+            return 1;
+        } else {
+            cd(args[1]);
         }
-        dup2(fd, STDOUT_FILENO); // redirect stdout to file
-        close(fd);
+        return 0;
+    } else if (strcmp(args[0], "pwd") == 0) {
+        char cwd[MAX_LINE];
+        if (getcwd(cwd, sizeof(cwd)) != NULL) {
+            printf("%s\n", cwd);
+        } else {
+            if (!interactive_mode) {
+                perror("wsh: pwd");
+            }
+        }
+        return 0;
+    } else if (strcmp(args[0], "export") == 0) {
+        handle_export(args[1]); 
+        return 0;
+    } else if (strcmp(args[0], "local") == 0) {
+        local(args[1]);
+        return 0;
+    } else if (strcmp(args[0], "vars") == 0) {
+        show_vars();
+        return 0;
+    } else if (strcmp(args[0], "history") == 0) {
+        return process_history_builtin(args);
+    } else if (strcmp(args[0], "ls") == 0) {
+        ls();
+        return 0;
+    } else if (strcmp(args[0], "exit") == 0) {
+        handle_exit();
+        return 0;
     }
-    else if (redirect_type == 2) // input redirection
-    {
-        fd = open(filename, O_RDONLY);
-        if (fd == -1)
-        {
-            perror("Failed to open input file");
-            exit(1);
-        }
-        dup2(fd, STDIN_FILENO); // redirect stdin to file
-        close(fd);
-    }
-    else if (redirect_type == 3) // append output redirection
-    {
-        fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd == -1)
-        {
-            perror("Failed to open output file");
-            exit(1);
-        }
-        dup2(fd, STDOUT_FILENO); // redirect stdout to file
-        close(fd);
-    }
-    else if (redirect_type == 4) // redirect stdout and stderr to the same file
-    {
-        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd == -1)
-        {
-            perror("Failed to open output file");
-            exit(1);
-        }
-        dup2(fd, STDOUT_FILENO); // redirect stdout
-        dup2(fd, STDERR_FILENO); // redirect stderr
-        close(fd);
-    }
-    else if (redirect_type == 5) // append stdout and stderr to the same file
-    {
-        fd = open(filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (fd == -1)
-        {
-            perror("Failed to open output file");
-            exit(1);
-        }
-        dup2(fd, STDOUT_FILENO); // redirect stdout
-        dup2(fd, STDERR_FILENO); // redirect stderr
-        close(fd);
-    }
-    else if (redirect_type == 6) // redirect stderr only
-    {
-        fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (fd == -1)
-        {
-            perror("Failed to open error file");
-            exit(1);
-        }
-        dup2(fd, STDERR_FILENO); // redirect stderr to file
-        close(fd);
+    return -1;
+}
+
+
+// helper for displaying local vars
+void show_vars() {
+    for (int i = 0; i < var_count; i++) {
+        printf("%s=%s\n", shell_vars[i].name, shell_vars[i].value);
     }
 }
 
-// parse redirection into a command string and set up redirect_type
-void parse_redirection(char *command, int *redirect_type, char **filename)
-{
-    // check for redirection symbols in the command
-    char *redir_pos = NULL;
 
-    if (strstr(command, "2>"))
-    {
-        *redirect_type = 6; // redirect stderr only
-        *filename = strstr(command, "2>") + 2; // filename follows 2>
-        *strstr(command, "2>") = '\0'; // truncate command
-    }
-    else if ((redir_pos = strstr(command, ">")))
-    {
-        *redirect_type = 1; // output redirection
-        *filename = redir_pos + 1; // filename follows >
-        *redir_pos = '\0'; 
-    }
-    else if ((redir_pos = strstr(command, "<")))
-    {
-        *redirect_type = 2; // input redirection
-        *filename = redir_pos + 1; 
-        *redir_pos = '\0';
-    }
-    else if ((redir_pos = strstr(command, ">>")))
-    {
-        *redirect_type = 3; // append output redirection
-        *filename = redir_pos + 2;
-        *redir_pos = '\0'; 
-    }
-    else if ((redir_pos = strstr(command, "&>")))
-    {
-        *redirect_type = 4; // redirect both stdout and stderr
-        *filename = redir_pos + 2; 
-        *redir_pos = '\0';
-    }
-    else if ((redir_pos = strstr(command, "&>>")))
-    {
-        *redirect_type = 5; // append both stdout and stderr
-        *filename = redir_pos + 3; 
-        *redir_pos = '\0'; 
+
+
+int cmp_entries(const void *a, const void *b) {
+    const char **entryA = (const char **)a;
+    const char **entryB = (const char **)b;
+    return strcmp(*entryA, *entryB);
+}
+
+void ls() {
+    DIR *dir;
+    struct dirent *entry;
+    char *entries[MAX_LINE];
+    int count = 0;
+
+    setlocale(LC_COLLATE, "C");
+
+    dir = opendir(".");
+    if (dir == NULL) {
+        perror("wsh: ls");
+        return;
     }
 
-    // remove leading spaces
-    if (filename && *filename)
-    {
-        while (**filename == ' ')
-        {
-            (*filename)++;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] != '.') {
+            entries[count++] = strdup(entry->d_name); 
         }
+    }
+    closedir(dir);
+    qsort(entries, count, sizeof(char *), cmp_entries);
+
+    for (int i = 0; i < count; i++) {
+        printf("%s\n", entries[i]);
+        free(entries[i]);
     }
 }
 
-// getter for a shell variable value
-const char *get_shell_var(const char *varname)
-{
-    for (int i = 0; i < num_vars; i++)
-    {
-        if (strcmp(shell_vars[i].name, varname) == 0)
-        {
-            return shell_vars[i].value;
-        }
+
+void cd(char *path) {
+    if (path == NULL) {
+        fprintf(stderr, "wsh: cd: missing argument\n");
+    } else if (chdir(path) != 0) {
+        perror("wsh: cd");
     }
-    return ""; // if variable doesn't exist, return empty string
 }
 
-// setter for a shell variable
-void set_shell_var(const char *varname, const char *value)
-{
-    for (int i = 0; i < num_vars; i++)
-    {
-        if (strcmp(shell_vars[i].name, varname) == 0)
-        {
-            // update existing variable
+void handle_exit() {
+    exit(EXIT_SUCCESS);
+	}
+
+void handle_export(char *var) {
+    if (var == NULL) {
+        if (!interactive_mode) {
+            fprintf(stderr, "wsh: export: missing argument\n");
+        }
+        last_exit_status = 1;
+        return;
+    }
+
+    char var_copy[MAX_LINE];
+    snprintf(var_copy, sizeof(var_copy), "%s", var);
+
+    char *name = strtok(var_copy, "=");
+    char *value = strtok(NULL, "=");
+    if (value == NULL) {
+        if (!interactive_mode) {
+            fprintf(stderr, "wsh: export: invalid argument\n");
+        }
+        last_exit_status = 1;
+        return;
+    }
+
+    if (strcmp(name, "PATH") == 0) {
+        char path_copy[MAX_LINE];
+        snprintf(path_copy, sizeof(path_copy), "%s", value);
+        char *path = strtok(path_copy, ":");
+        bool all_invalid = true;  
+        while (path != NULL) {
+            struct stat statbuf;
+            if (stat(path, &statbuf) == 0 && S_ISDIR(statbuf.st_mode)) {
+                all_invalid = false;
+                break;  
+            }
+            path = strtok(NULL, ":");
+        }
+        if (all_invalid) {
+            if (!interactive_mode) {
+                fprintf(stderr, "wsh: export: invalid PATH value\n");
+            }
+            path_invalid = true;
+        }
+    }
+
+    if (setenv(name, value, 1) != 0) {
+        if (!interactive_mode) {
+            perror("wsh: export");
+        }
+        last_exit_status = 1;
+        return;
+    }
+
+    last_exit_status = 0;
+}
+
+
+void local(char *var) {
+    if (var == NULL) {
+        fprintf(stderr, "wsh: local: missing argument\n");
+        return;
+    }
+
+    char *name = strtok(var, "=");
+    char *value = strtok(NULL, "=");
+    if (value == NULL) {
+        value = "";  
+    }
+
+    // variable replacement
+    if (value[0] == '$') {
+        char *var_name = value + 1; 
+        
+        char *env_value = getenv(var_name);
+        if (env_value != NULL) {
+            value = env_value;  
+        } else {
+            for (int j = 0; j < var_count; j++) {
+                if (strcmp(shell_vars[j].name, var_name) == 0) {
+                    value = shell_vars[j].value; 
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < var_count; i++) {
+        if (strcmp(shell_vars[i].name, name) == 0) {
             strcpy(shell_vars[i].value, value);
             return;
         }
     }
-    // add new variable
-    if (num_vars < MAX_VARS)
+
+    if (var_count < MAX_VARS) 
     {
-        strcpy(shell_vars[num_vars].name, varname);
-        strcpy(shell_vars[num_vars].value, value);
-        num_vars++;
-    }
-    else
-    {
-        fprintf(stderr, "Error: Maximum number of shell variables reached.\n");
+        strcpy(shell_vars[var_count].name, name);
+        strcpy(shell_vars[var_count].value, value);
+        var_count++;
+    } else {
+        fprintf(stderr, "wsh: local: too many variables\n");
     }
 }
 
-// expand var after $ to value
-void expand_variables(char *command)
-{
-    char expanded_command[MAX_COMMAND_LENGTH];
-    char *read_ptr = command;
-    char *write_ptr = expanded_command;
-    while (*read_ptr)
-    {
-        if (*read_ptr == '$')
-        {
-            read_ptr++;
-            char varname[MAX_VAR_LENGTH];
-            char *var_ptr = varname;
 
-            // collect valid variable name characters
-            if (isalpha(*read_ptr) || *read_ptr == '_')
-            {
-                while (*read_ptr && (isalnum(*read_ptr) || *read_ptr == '_'))
-                {
-                    *var_ptr++ = *read_ptr++;
-                }
-                *var_ptr = '\0';
+// substitition helper
+void sub_var(char **args) {
+    for (int i = 0; args[i] != NULL; i++) {
+        if (args[i][0] == '$') {
+            char *var_name = args[i] + 1;  
+            char *env_value = getenv(var_name);
+            if (env_value != NULL) {
+                args[i] = env_value; 
+                continue;
+            }
 
-                // lookup variable value
-                const char *var_value = getenv(varname);
-                if (var_value == NULL)
-                {
-                    var_value = get_shell_var(varname);
-                }
-
-                // replace with variable value
-                if (var_value)
-                {
-                    while (*var_value)
-                    {
-                        *write_ptr++ = *var_value++;
-                    }
+            for (int j = 0; j < var_count; j++) {
+                if (strcmp(shell_vars[j].name, var_name) == 0) {
+                    args[i] = shell_vars[j].value; 
+                    break;
                 }
             }
-            else
-            {
-                // if not a valid variable name, treat '$' as a literal
-                *write_ptr++ = '$';
-            }
-        }
-        else
-        {
-            *write_ptr++ = *read_ptr++;
         }
     }
-    *write_ptr = '\0';
-    strcpy(command, expanded_command); // replace the original command
 }
 
-// local command handler for setting shell variables
-void handle_local_command(char *command)
-{
-    // find the '=' character to split the variable name and value
-    char *equal_sign = strchr(command, '=');
 
-    if (equal_sign == NULL)
-    {
-        // no '=' found, invalid assignment
-        fprintf(stderr, "Error: Invalid local variable assignment\n");
-        last_cmd_rc = 1;
-        return;
-    }
-
-    // null-terminate at '=' to extract the variable name
-    *equal_sign = '\0';
-    char *varname = command;
-    char *value = equal_sign + 1;
-
-    // check if the variable name starts with a '$'
-    if (varname[0] == '$')
-    {
-        fprintf(stderr, "Error: Invalid variable name starting with $\n");
-        last_cmd_rc = 1;
-        return;
-    }
-
-    // check if the variable name contains only alphanumeric characters and underscores
-    for (int i = 0; varname[i] != '\0'; i++)
-    {
-        if (!isalnum(varname[i]) && varname[i] != '_')
-        {
-            fprintf(stderr, "Error: Invalid variable name\n");
-            last_cmd_rc = 1;
-            return;
-        }
-    }
-
-    // if variable name is valid
-    if (varname != NULL && value != NULL)
-    {
-        // expand variables in value (e.g., local a=$b)
-        expand_variables(value);
-        set_shell_var(varname, value);
-        last_cmd_rc = 0;
-    }
-    else if (varname != NULL && value == NULL)
-    {
-        set_shell_var(varname, ""); // clear the variable if no value is given
-        last_cmd_rc = 1;
-    }
-}
-
-// handle export command
-void handle_export_command(char *command)
-{
-    char *varname = strtok(command, "=");
-    char *value = strtok(NULL, "=");
-
-    // if variable name is valid
-    if (varname != NULL && value != NULL)
-    {
-        // set environment variable
-        setenv(varname, value, 1); // 1 means overwrite existing value
-        last_cmd_rc = 0;
-    }
-    else if (varname != NULL && value == NULL)
-    {
-        fprintf(stderr, "Error: export without value is not allowed\n");
-        last_cmd_rc = 1;
-    }
-}
-
-// handle the vars command (display shell variables)
-void handle_vars_command()
-{
-    for (int i = 0; i < num_vars; i++)
-    {
-        printf("%s=%s\n", shell_vars[i].name, shell_vars[i].value);
-    }
-    last_cmd_rc = 0;
-}
-
-void init_history()
-{
-    history.commands = (char **)malloc(DEFAULT_HISTORY_SIZE * sizeof(char *));
-    history.capacity = DEFAULT_HISTORY_SIZE;
-}
-
-// insert command to history
-void insert_history(const char *command)
-{
-    // don't store built-in commands in history
-    if (is_builtin_command(command))
-    {
+void history_add(char *cmd) {
+    if (history_size == 0) {
         return; 
     }
 
-    // prevent consecutive duplicate commands
-    if (history.count > 0)
-    {
-        int last_index = (history.end - 1 + history.capacity) % history.capacity;
-        if (strcmp(history.commands[last_index], command) == 0)
-        {
-            return;
-        }
+    char trimmed_cmd[MAX_LINE];
+    strncpy(trimmed_cmd, cmd, sizeof(trimmed_cmd) - 1);
+    trimmed_cmd[sizeof(trimmed_cmd) - 1] = '\0';
+
+    char *start = trimmed_cmd;
+    while (*start == ' ' || *start == '\t') {
+        start++;
     }
-
-    // if history is full, overwrite the oldest command
-    if (history.count == history.capacity)
-    {
-        free(history.commands[history.start]);
-        history.commands[history.start] = strdup(command);
-        history.start = (history.start + 1) % history.capacity;
-        history.end = (history.end + 1) % history.capacity;
+    char *end = start + strlen(start) - 1;
+    while (end > start && (*end == ' ' || *end == '\t')) {
+        *end = '\0';
+        end--;
     }
-    else
-    {
-        // add the new command to the end of the circular buffer
-        history.commands[history.end] = strdup(command);
-        history.end = (history.end + 1) % history.capacity;
-        history.count++;
-    }
-}
-
-void print_history()
-{
-    int index = history.start;
-    for (int i = 0; i < history.count; i++)
-    {
-        printf("%d) %s\n", i + 1, history.commands[index]);
-        index = (index + 1) % history.capacity;
-    }
-    last_cmd_rc = 0;
-}
-
-// execute the n-th command from history
-void handle_history_command(int n)
-{
-    if (n <= 0 || n > history.count)
-    {
-        last_cmd_rc = 1;
-        return; // Invalid command number
-    }
-
-    int index = (history.start + n - 1) % history.capacity;
-
-    // Execute the command without adding it to history
-    execute_command(history.commands[index]);
-}
-
-// set history to a given size
-void set_history_size(int new_size)
-{
-    if (new_size <= 0)
-    {
-        last_cmd_rc = 1;
-        return; 
-    }
-
-    // allocate new history buffer
-    char **new_commands = (char **)malloc(new_size * sizeof(char *));
-    int new_count = 0;
-    int new_end = 0;
-
-    // copy over commands that will fit into the new buffer
-    int index = history.start;
-    for (int i = 0; i < history.count && new_count < new_size; i++)
-    {
-        new_commands[new_end++] = history.commands[index];
-        new_count++;
-        index = (index + 1) % history.capacity;
-    }
-
-    // free the remaining commands that don't fit
-    for (int i = new_count; i < history.count; i++)
-    {
-        free(history.commands[index]);
-        index = (index + 1) % history.capacity;
-    }
-
-    // free the old history
-    free(history.commands);
-
-    // update history struct with new buffer
-    history.commands = new_commands;
-    history.capacity = new_size;
-    history.count = new_count;
-    history.start = 0;
-    history.end = new_end;
-    last_cmd_rc = 0;
-}
-
-// built-in cd command handler
-void handle_cd_command(char *args[])
-{
-    if (args[1] == NULL || args[2] != NULL)
-    {
-        fprintf(stderr, "cd: wrong number of arguments\n");
-        last_cmd_rc = 1;
+    if (*start == '\0') {
         return;
     }
-    if (chdir(args[1]) != 0)
-    {
-        perror("cd failed");
-        last_cmd_rc = 1;
+    if (is_builtin_command(start)) {
+        return;  
     }
-    else
-    {
-        last_cmd_rc = 0;
+    if (hist_count > 0 && strcmp(start, history[hist_count - 1]) == 0) {
+        return;
+    }
+    if (hist_count < history_size) {
+        history[hist_count++] = strdup(start);
+    } else {
+        free(history[0]);
+        for (int i = 1; i < history_size; i++) {
+            history[i - 1] = history[i];
+        }
+        history[history_size - 1] = strdup(start);
     }
 }
 
-// helper compare function for qsort (alphabetical order)
-int compare_filenames(const void *a, const void *b)
-{
-    const char *file_a = *(const char **)a;
-    const char *file_b = *(const char **)b;
-    return strcmp(file_a, file_b);
+
+
+//helper to trim whitespace
+char *trimmer(char *str) {
+    char *end;
+    while (*str == ' ' || *str == '\t') {
+        str++;
+    }
+
+    if (*str == 0) {
+        return str;
+    }
+
+    end = str + strlen(str) - 1;
+    while (end > str && (*end == ' ' || *end == '\t')) {
+        end--;
+    }
+
+    *(end + 1) = '\0';
+
+    return str;
 }
 
-void handle_ls_command()
-{
-    DIR *dir;
-    struct dirent *entry;
-    char *filenames[1024]; // array to store file names, size will adjust later
-    int count = 0;
 
-    dir = opendir(".");
-    if (!dir)
-    {
-        perror("ls");
-        last_cmd_rc = 1;
+
+void show_hist() {
+    for (int i = hist_count - 1; i >= 0; i--) {
+        printf("%d) %s\n", hist_count - i, history[i]);
+    }
+}
+
+// helper tp  check if command is builtin
+bool is_builtin_command(char *cmd) {
+    char temp_cmd[MAX_LINE];
+    strncpy(temp_cmd, cmd, sizeof(temp_cmd) - 1);
+    temp_cmd[sizeof(temp_cmd) - 1] = '\0';
+    char *first_token = strtok(temp_cmd, " ");
+
+    if (first_token == NULL) {
+        return false;
+    }
+
+    if (strcmp(first_token, "cd") == 0 ||  
+        strcmp(first_token, "export") == 0 || strcmp(first_token, "local") == 0 || 
+        strcmp(first_token, "vars") == 0 || strcmp(first_token, "ls") == 0 || 
+        strcmp(first_token, "exit") == 0 || strcmp(first_token, "history") == 0) {
+        return true;
+    }
+    return false;
+}
+
+
+// get command from history
+void process_history_command(int index) {
+    if (index < 0 || index >= hist_count) {
+        fprintf(stderr, "wsh: no such command in history\n");
         return;
     }
 
-    // collect filenames from the directory
-    while ((entry = readdir(dir)) != NULL)
-    {
-        // ignore hidden files (starting with .)
-        if (entry->d_name[0] != '.')
-        {                                             
-            filenames[count] = strdup(entry->d_name); // duplicate the name for sorting
-            count++;
-        }
-    }
-    closedir(dir);
-
-    // sort the filenames alphabetically
-    qsort(filenames, count, sizeof(char *), compare_filenames);
-
-    // print the sorted filenames
-    for (int i = 0; i < count; i++)
-    {
-        printf("%s\n", filenames[i]);
-    }
-    last_cmd_rc = 0;
-    // remember to free
-    for (int i = 0; i < count; i++)
-    {
-        free(filenames[i]); 
-    }
+    char *command = history[index];
+    printf("%s\n", command);  
+    process_cmd(command, false); 
 }
 
-// print a specific error message to stderr
-void print_error(const char *message)
-{
-    fprintf(stderr, "%s\n", message);
-}
-
-// helper function to check if a line starts with # 
-int is_comment(char *line)
-{
-    // remove leading spaces
-    while (*line == ' ')
-    {
-        line++;
-    }
-    // check if the line starts with '#'
-    return (*line == '#');
-}
-
-// helper function to search for the executable in directories listed in PATH
-int find_command_in_path(const char *command, char *full_path)
-{
-    char *path_env = getenv("PATH");
-    char *path = strdup(path_env); // duplicate the PATH string for manipulation
-    char *saveptr; // for strtok_r
-    char *dir = strtok_r(path, ":", &saveptr); // split PATH by :
-
-    // try each directory in PATH
-    while (dir != NULL)
-    {
-        snprintf(full_path, MAX_PATH_LENGTH, "%s/%s", dir, command);
-        if (access(full_path, X_OK) == 0)
-        {
-            free(path);
-            return 1; // found the command and it's executable
-        }
-        dir = strtok_r(NULL, ":", &saveptr);
-    }
-
-    free(path);
-    return 0; // command not found in any PATH directory
-}
-
-// check if a command is a built-in command
-int is_builtin_command(const char *cmd)
-{
-    // extract the first token to compare
-    char cmd_copy[MAX_COMMAND_LENGTH];
-    snprintf(cmd_copy, sizeof(cmd_copy), "%s", cmd);
-    char *token = strtok(cmd_copy, " ");
-
-    if (token == NULL)
-    {
+int process_history_builtin(char **args) {
+    if (args[1] == NULL) {
+        show_hist();  
         return 0;
     }
 
-    return strcmp(token, "exit") == 0 || strcmp(token, "cd") == 0 || strcmp(token, "ls") == 0 ||
-           strcmp(token, "local") == 0 || strcmp(token, "export") == 0 || strcmp(token, "vars") == 0 ||
-           strcmp(token, "history") == 0;
+    if (strcmp(args[1], "set") == 0) {
+        if (args[2] == NULL) {
+            fprintf(stderr, "wsh: missing size for history set\n");
+            return 1;
+        }
+        char *endptr;
+        int new_size = strtol(args[2], &endptr, 10);
+        if (*endptr != '\0' || new_size < 0 || new_size > MAX_HISTORY_SIZE) {
+            fprintf(stderr, "wsh: invalid history size\n");
+            return 1;
+        }
+
+        //clear if 0
+        if (new_size == 0) {
+            for (int i = 0; i < hist_count; i++) {
+                free(history[i]);
+                history[i] = NULL;
+            }
+            hist_count = 0;
+        } else if (new_size < history_size) {
+            int items_to_remove = hist_count - new_size;
+            if (items_to_remove > 0) {
+                for (int i = 0; i < items_to_remove; i++) {
+                    free(history[i]);
+                }
+                for (int i = 0; i < hist_count - items_to_remove; i++) {
+                    history[i] = history[i + items_to_remove];
+                }
+                hist_count -= items_to_remove;
+            }
+        }
+        history_size = new_size;
+        return 0;
+    }
+
+    char *endptr;
+    int index = strtol(args[1], &endptr, 10);  
+    if (*endptr != '\0' || index <= 0 || index > hist_count) {
+        fprintf(stderr, "wsh: invalid history index\n");
+        return 1;
+    }
+    index = hist_count - index;  
+    process_history_command(index);
+
+    return 0;
 }
 
-// execute a command using execv 
-void execute_command(char *command)
-{
-    // if not built-in, add command to history 
-    if (!is_builtin_command(command))
-    {
-        insert_history(command);
+
+
+int main(int argc, char *argv[]) {
+    if (setenv("PATH", "/bin", 1) != 0) {
+        perror("Failed to set PATH");
+        return 1;  
     }
 
-    char *args[MAX_ARGS];
-    int i = 0;
-    char *token;
-    int redirect_type = 0;
-    char *filename = NULL;
-
-    // find the comment delimiter '#' 
-    char *comment_pos = strchr(command, '#');
-    if (comment_pos != NULL)
-    {
-        *comment_pos = '\0'; // truncate the command at that spot
-    }
-
-    // parse redirection operators and filenames
-    parse_redirection(command, &redirect_type, &filename);
-
-    // expand variables
-    expand_variables(command);
-
-    // tokenize the command into arguments
-    token = strtok(command, " ");
-    while (token != NULL && i < MAX_ARGS - 1)
-    {
-        args[i++] = token; // regular command/argument
-        token = strtok(NULL, " ");
-    }
-    args[i] = NULL; // null-terminate the argument list
-
-    // if no command, return without doing anything
-    if (i == 0)
-    {
-        last_cmd_rc = 0;
-        return;
-    }
-
-    // check if this is the exit command
-    if (strcmp(args[0], "exit") == 0)
-    {
-        if (args[1] != NULL)
-        {
-            fprintf(stderr, "Error: exit does not take any arguments\n");
-            last_cmd_rc = 255; 
+    if (argc == 1) {
+        interactive_mode = 1;  
+        shell_loop();  
+    } else if (argc == 2) {
+        interactive_mode = 0;  
+        FILE *file = fopen(argv[1], "r");
+        if (!file) {
+            perror("Error opening batch file");
+            exit(EXIT_FAILURE);
         }
-        else
-        {
-            exit(last_cmd_rc);
-        }
-        return;
-    }
 
-    // check if this is a local commadn
-    if (strcmp(args[0], "local") == 0 && args[1] != NULL)
-    {
-        handle_local_command(args[1]); 
-        return;
-    }
+        char line[MAX_LINE];
+        while (fgets(line, sizeof(line), file)) {
+            line[strcspn(line, "\n")] = '\0';
 
-    // check if this is an export command
-    if (strcmp(args[0], "export") == 0 && args[1] != NULL)
-    {
-        handle_export_command(args[1]);
-        return;
-    }
-
-    // check if this is the vars command
-    if (strcmp(args[0], "vars") == 0)
-    {
-        handle_vars_command();
-        return;
-    }
-
-    // check if this is a history command
-    if (strcmp(args[0], "history") == 0)
-    {
-        if (args[1] == NULL)
-        {
-            print_history();
-        }
-        else if (strcmp(args[1], "set") == 0 && args[2] != NULL)
-        {
-            set_history_size(atoi(args[2]));
-        }
-        else
-        {
-            handle_history_command(atoi(args[1]));
-        }
-        return;
-    }
-
-    // check if this is a cd command
-    if (strcmp(args[0], "cd") == 0)
-    {
-        handle_cd_command(args); 
-        return;
-    }
-
-    // check if this is a ls command
-    if (strcmp(args[0], "ls") == 0)
-    {
-        handle_ls_command(); 
-        return;
-    }
-
-    // check if this is a full or relative path (contains /)
-    if (strchr(args[0], '/') != NULL)
-    {
-        if (access(args[0], X_OK) == 0)
-        {
-            pid_t pid = fork();
-            if (pid < 0)
-            {
-                print_error("Fork failed");
-                last_cmd_rc = 1;
-                return;
+            char *trimmed_line = line;
+            while (*trimmed_line == ' ' || *trimmed_line == '\t') {
+                trimmed_line++;  
             }
-            else if (pid == 0)
-            {
-                // child process: execute the command
-                if (redirect_type > 0 && filename != NULL)
-                {
-                    handle_redirection(redirect_type, filename);
-                }
-                execv(args[0], args);
-                // if execv returns, there was an error
-                fprintf(stderr, "Command execution failed\n");
-                exit(1);
+
+            if (trimmed_line[0] == '#' || trimmed_line[0] == '\0') {
+                continue; 
             }
-            else
-            {
-                // parent process: wait for the child to finish
-                int status;
-                waitpid(pid, &status, 0);
 
-                if (WIFEXITED(status))
-                {
-                    last_cmd_rc = WEXITSTATUS(status);
-                }
-                else
-                {
-                    last_cmd_rc = 1;
-                }
-            }
+            process_cmd(trimmed_line, true);
         }
-        else
-        {
-            last_cmd_rc = 255; // Command not found
-        }
-        return;
+        fclose(file);
+    } else {
+        fprintf(stderr, "Usage: %s [batch_file]\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    // construct the full path for the command
-    char full_path[MAX_PATH_LENGTH];
-    if (!find_command_in_path(args[0], full_path))
-    {
-        last_cmd_rc = 255; // Command not found
-        return;
+    if (path_invalid) {
+        return 255;  //invalid path
+    } else {
+        return last_exit_status;  
     }
-
-    // Fork and execute the command
-    pid_t pid = fork();
-    if (pid < 0)
-    {
-        print_error("Fork failed");
-        last_cmd_rc = 1;
-        return;
-    }
-    else if (pid == 0)
-    {
-        // Child process: execute the command
-        if (redirect_type > 0 && filename != NULL)
-        {
-            handle_redirection(redirect_type, filename);
-        }
-        execv(full_path, args);
-        // If execv returns, there was an error
-        fprintf(stderr, "Command execution failed\n");
-        exit(1);
-    }
-    else
-    {
-        // Parent process: wait for the child to finish
-        int status;
-        waitpid(pid, &status, 0);
-
-        if (WIFEXITED(status))
-        {
-            last_cmd_rc = WEXITSTATUS(status);
-        }
-        else
-        {
-            last_cmd_rc = 1;
-        }
-    }
-}
-
-int main(int argc, char *argv[])
-{
-    init_path();
-    init_history();
-
-    if (argc > 2)
-    {
-        print_error("Usage: ./wsh [batch_file]");
-        exit(1);
-    }
-    else if (argc == 2)
-    {
-        // Batch mode
-        batch_mode(argv[1]);
-    }
-    else
-    {
-        // Interactive mode
-        interactive_mode();
-    }
-
-    return last_cmd_rc;
 }

@@ -1,0 +1,5 @@
+# This is a comment
+echo Hello, world
+ls
+# Another comment
+pwd
